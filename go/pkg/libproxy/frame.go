@@ -9,7 +9,7 @@ import (
 )
 
 // Proto is the protocol of the flow
-type Proto uint8
+type Proto uint16
 
 const (
 	// TCP flow
@@ -109,9 +109,9 @@ func (d Destination) Write(w io.Writer) error {
 func (d Destination) Size() int {
 	switch d.Proto {
 	case TCP, UDP:
-		return 1 + 2 + len(d.IP) + 2
+		return 2 + 2 + len(d.IP) + 2
 	case Unix:
-		return 1 + 2 + len(d.Path)
+		return 2 + 2 + len(d.Path)
 	}
 	return 0
 }
@@ -217,11 +217,11 @@ func (win *WindowFrame) Size() int {
 }
 
 // Command is the action requested by a message.
-type Command int8
+type Command int16
 
 const (
 	// Open requests to open a connection to a backend service.
-	Open Command = iota + 1
+	Open Command = iota + 256 + 1
 	// Close requests and then acknowledges the close of a sub-connection
 	Close
 	// Shutdown indicates that no more data will be written in this direction
@@ -317,7 +317,7 @@ func (f *Frame) Write(w io.Writer) error {
 // Size returns the marshalled size of the frame
 func (f *Frame) Size() int {
 	// include 2 for the preceeding length field
-	len := 2 + 1 + 4
+	len := 2 + 2 + 4
 	switch f.Command {
 	case Open:
 		len = len + f.open.Size()

@@ -602,6 +602,7 @@ func (m *multiplexer) run() error {
 		if err != nil {
 			return err
 		}
+		log.Infof("received frame %s", f.String())
 		m.appendEvent(&event{eventType: eventRecv, frame: f})
 		switch payload := f.Payload().(type) {
 		case *OpenFrame:
