@@ -10,6 +10,7 @@ import (
 	"runtime/pprof"
 	"syscall"
 
+	"github.com/moby/vpnkit/go/pkg/libproxy"
 	"github.com/moby/vpnkit/go/pkg/vpnkit/control"
 	"github.com/moby/vpnkit/go/pkg/vpnkit/http"
 )
@@ -18,6 +19,7 @@ var (
 	controlListen string
 	dataListen    string
 	dataConnect   string
+	pcap          string
 	debug         bool
 )
 
@@ -26,6 +28,7 @@ func main() {
 	flag.StringVar(&controlListen, "control-listen", "", "AF_VSOCK port or socket/Pipe path to listen for control connections")
 	flag.StringVar(&dataListen, "data-listen", "", "AF_VSOCK port or socket/Pipe path to listen for data connections on")
 	flag.StringVar(&dataConnect, "data-connect", "", "AF_VSOCK port or socket/Pipe path to connect to on the host for data connections")
+	flag.StringVar(&pcap, "pcap", "", "PCAP file path")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 	flag.Parse()
 	if dataListen == "" && dataConnect == "" {
@@ -34,7 +37,16 @@ func main() {
 	quit := make(chan struct{})
 	defer close(quit)
 
-	ctrl := control.Make()
+	var rec *libproxy.PcapRecorder
+	if pcap != "" {
+		new_rec, err := libproxy.NewPcapRecorder(pcap)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rec = new_rec
+		defer new_rec.Close()
+	}
+	ctrl := control.MakeWithPcapRecorder(rec)
 
 	if controlListen != "" {
 		s, err := http.NewServer(controlListen, ctrl)

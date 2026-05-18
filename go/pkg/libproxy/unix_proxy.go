@@ -25,7 +25,7 @@ func NewUnixProxy(listener net.Listener, backendAddr *net.UnixAddr) (*UnixProxy,
 }
 
 // HandleUnixConnection forwards the Unix traffic to a specified backend address
-func HandleUnixConnection(client Conn, backendAddr *net.UnixAddr, quit <-chan struct{}) error {
+func HandleUnixConnection(client Conn, backendAddr *net.UnixAddr, quit <-chan struct{}, rec *PcapRecorder) error {
 	start := time.Now()
 	for {
 		backend, err := net.DialUnix("unix", nil, backendAddr)
@@ -41,7 +41,8 @@ func HandleUnixConnection(client Conn, backendAddr *net.UnixAddr, quit <-chan st
 			}
 			return fmt.Errorf("can't forward traffic to backend unix/%v: %s", backendAddr, err)
 		}
-		return ProxyStream(client, backend, quit)
+		c, b := RecordStream(rec, client, backend)
+		return ProxyStream(c, b, quit)
 	}
 }
 
@@ -55,7 +56,7 @@ func (proxy *UnixProxy) Run() {
 			log.Printf("Stopping proxy on unix/%v for unix/%v (%s)", proxy.frontendAddr, proxy.backendAddr, err)
 			return
 		}
-		go HandleUnixConnection(client.(Conn), proxy.backendAddr, quit)
+		go HandleUnixConnection(client.(Conn), proxy.backendAddr, quit, nil)
 	}
 }
 

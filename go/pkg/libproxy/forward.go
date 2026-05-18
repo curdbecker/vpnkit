@@ -6,7 +6,7 @@ import (
 )
 
 // Forward a connection to a given destination.
-func Forward(conn Conn, destination Destination, quit <-chan struct{}) {
+func Forward(conn Conn, destination Destination, quit <-chan struct{}, rec *PcapRecorder) {
 	defer conn.Close()
 
 	switch destination.Proto {
@@ -17,12 +17,12 @@ func Forward(conn Conn, destination Destination, quit <-chan struct{}) {
 			return
 		}
 	case Unix:
-		backendAddr, err := net.ResolveUnixAddr("unix", destination.Path)
+		backendAddr, err := net.ResolveUnixAddr("unix", "/Users/becker/Library/Containers/com.docker.docker/Data/"+destination.Path+".sock")
 		if err != nil {
 			log.Printf("Error resolving Unix address %s", destination.Path)
 			return
 		}
-		if err := HandleUnixConnection(conn, backendAddr, quit); err != nil {
+		if err := HandleUnixConnection(conn, backendAddr, quit, rec); err != nil {
 			log.Printf("closing Unix proxy because %v", err)
 			return
 		}

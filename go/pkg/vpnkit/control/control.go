@@ -24,6 +24,7 @@ type Control struct {
 	muxC      *sync.Cond
 	forwards  map[string]forward.Forward
 	forwardsM sync.Mutex
+	rec       *libproxy.PcapRecorder // nil unless pcap set
 }
 
 func Make() *Control {
@@ -32,6 +33,19 @@ func Make() *Control {
 	}
 	c.muxC = sync.NewCond(&c.muxM)
 	return c
+}
+
+func MakeWithPcapRecorder(rec *libproxy.PcapRecorder) *Control {
+	c := &Control{
+		forwards: make(map[string]forward.Forward),
+		rec:      rec,
+	}
+	c.muxC = sync.NewCond(&c.muxM)
+	return c
+}
+
+func (c *Control) PcapRecorder() *libproxy.PcapRecorder {
+	return c.rec
 }
 
 func (c *Control) SetMux(m libproxy.Multiplexer) {
@@ -208,6 +222,6 @@ func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{}, al
 			log.Errorf("error accepting subconnection: %v", err)
 			return
 		}
-		go libproxy.Forward(conn, *destination, quit)
+		go libproxy.Forward(conn, *destination, quit, c.rec)
 	}
 }

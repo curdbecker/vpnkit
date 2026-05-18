@@ -52,7 +52,8 @@ func (s *stream) Run() {
 			continue // Multiplexer could be disconnected
 		}
 		go func() {
-			if err := libproxy.ProxyStream(src, dest, s.quit); err != nil {
+			cc, dd := libproxy.RecordStream(s.ctrl.PcapRecorder(), src, dest)
+			if err := libproxy.ProxyStream(cc, dd, s.quit); err != nil {
 				log.Errorf("unable to proxy on %s: %s", s.port.String(), err)
 			}
 			if err := src.Close(); err != nil {
