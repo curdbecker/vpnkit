@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"runtime/pprof"
 	"syscall"
@@ -16,37 +17,74 @@ import (
 )
 
 var (
-	controlListen string
-	dataListen    string
-	dataConnect   string
-	pcap          string
-	debug         bool
+	controlListen       string
+	dataListen          string
+	dataListenFd        string
+	dataListenHandshake string
+	dataConnect         string
+	dockerDataPath      string
+	pcap                string
+	servicesFile        string
+	debug               bool
 )
+
+func getDefaultDockerPath() string {
+	user, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(user.HomeDir, "/Library/Containers/com.docker.docker/Data/")
+}
 
 // Listen on either AF_VSOCK or AF_HVSOCK (depending on the kernel) for multiplexed connections
 func main() {
 	flag.StringVar(&controlListen, "control-listen", "", "AF_VSOCK port or socket/Pipe path to listen for control connections")
 	flag.StringVar(&dataListen, "data-listen", "", "AF_VSOCK port or socket/Pipe path to listen for data connections on")
+	flag.StringVar(&dataListenFd, "data-listen-fd", "",
+		"AF_VSOCK port or socket/Pipe path to listen to receive data connection multiplexing fds from com.docker.virtualization (requires services file)")
+	flag.StringVar(&dataListenHandshake, "data-listen-handshake", "",
+		"AF_VSOCK port or socket/Pipe path to listen to receive connection from docker's vpnkit daemon inside the VM (requires services file) (same data-listen-fd just without fd)")
 	flag.StringVar(&dataConnect, "data-connect", "", "AF_VSOCK port or socket/Pipe path to connect to on the host for data connections")
+	flag.StringVar(&dockerDataPath, "docker-data-path", getDefaultDockerPath(),
+		"path to docker data directory with UNIX sockets (default: ~/Library/Containers/com.docker.docker/Data/)")
 	flag.StringVar(&pcap, "pcap", "", "PCAP file path")
+	flag.StringVar(&servicesFile, "services", "", "path to a services JSON file; host-backed entries are exposed as Unix pipe forwards")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 	flag.Parse()
-	if dataListen == "" && dataConnect == "" {
-		log.Fatal("You must provide either -data-listen or -data-connect to establish a data connection")
+	if dataListen == "" && dataListenFd == "" && dataListenHandshake == "" && dataConnect == "" {
+		log.Fatal("You must provide either -data-listen or -data-listen-fd or -data-listen-handshake or -data-connect to establish a data connection")
 	}
+
 	quit := make(chan struct{})
 	defer close(quit)
 
+	var err error
+
 	var rec *libproxy.PcapRecorder
 	if pcap != "" {
-		new_rec, err := libproxy.NewPcapRecorder(pcap)
+		rec, err = libproxy.NewPcapRecorder(pcap)
 		if err != nil {
 			log.Fatal(err)
 		}
-		rec = new_rec
-		defer new_rec.Close()
+		defer rec.Close()
 	}
-	ctrl := control.MakeWithPcapRecorder(rec)
+
+	var services libproxy.Services
+	if dataListenFd != "" || dataListenHandshake != "" {
+		if servicesFile == "" {
+			log.Fatalf("must provide services file with -data-listen-fd")
+		}
+		if dockerDataPath == "" {
+			log.Fatalf("must provide valid -docker-data-path")
+		}
+
+		services, err = libproxy.LoadServices(servicesFile)
+		if err != nil {
+			log.Fatalf("reading services file %s: %s", servicesFile, err)
+		}
+	}
+
+	ctrl := control.MakeWithOptions(rec, services, &dockerDataPath)
 
 	if controlListen != "" {
 		s, err := http.NewServer(controlListen, ctrl)
@@ -59,11 +97,17 @@ func main() {
 	}
 
 	if dataListen != "" {
-		go ctrl.Listen(dataListen, quit)
+		go ctrl.Listen(dataListen, false, false, quit)
+	}
+	if dataListenFd != "" {
+		go ctrl.Listen(dataListenFd, true, true, quit)
+	}
+	if dataListenHandshake != "" {
+		go ctrl.Listen(dataListenHandshake, false, true, quit)
 	}
 	if dataConnect != "" {
 		go func() {
-			if err := ctrl.Connect(dataConnect, quit); err != nil {
+			if err := ctrl.Connect(dataConnect, false, quit); err != nil {
 				fmt.Printf("unable to connect data on %s: %s\n", dataConnect, err)
 			}
 		}()

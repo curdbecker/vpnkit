@@ -1,13 +1,50 @@
 package libproxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
+// service is one entry in the services file.
+type service struct {
+	Guest string `json:"guest"`
+	Host  string `json:"host,omitempty"`
+	// not supported yet
+	FailFastOnDial bool `json:"failFastOnDial,omitempty"`
+	NoopCloseWrite bool `json:"noopCloseWrite,omitempty"`
+}
+
+type Services map[string]service
+
+// Load reads and parses the services file at path.
+func LoadServices(path string) (Services, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading services file %s: %w", path, err)
+	}
+	var services Services
+	if err := json.Unmarshal(b, &services); err != nil {
+		return nil, fmt.Errorf("parsing services file %s: %w", path, err)
+	}
+	for _, service := range services {
+		if service.Host != "" {
+			service.Host, _ = strings.CutPrefix(service.Host, "unix://")
+		}
+	}
+
+	return services, nil
+}
+
 // Forward a connection to a given destination.
-func Forward(conn Conn, destination Destination, quit <-chan struct{}, rec *PcapRecorder) {
+func Forward(conn Conn, destination Destination, quit <-chan struct{},
+	rec *PcapRecorder, services Services, dockerDataPath *string) {
 	defer conn.Close()
+
+	log.Printf("forward to %s requested", destination)
 
 	switch destination.Proto {
 	case TCP:
@@ -17,9 +54,20 @@ func Forward(conn Conn, destination Destination, quit <-chan struct{}, rec *Pcap
 			return
 		}
 	case Unix:
-		backendAddr, err := net.ResolveUnixAddr("unix", "/Users/becker/Library/Containers/com.docker.docker/Data/"+destination.Path+".sock")
+		var destinationPath string
+		if services == nil {
+			destinationPath = destination.Path
+		} else {
+			destinationPath = filepath.Join(*dockerDataPath, destination.Path+".sock")
+			if service, ok := services[destination.Path]; ok && service.Host != "" {
+				destinationPath = service.Host
+			}
+		}
+		log.Printf("forwarding to %s", destinationPath)
+
+		backendAddr, err := net.ResolveUnixAddr("unix", destinationPath)
 		if err != nil {
-			log.Printf("Error resolving Unix address %s", destination.Path)
+			log.Printf("Error resolving Unix address %s", destinationPath)
 			return
 		}
 		if err := HandleUnixConnection(conn, backendAddr, quit, rec); err != nil {

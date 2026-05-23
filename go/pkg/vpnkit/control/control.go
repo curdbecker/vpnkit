@@ -2,10 +2,13 @@ package control
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -18,27 +21,27 @@ import (
 )
 
 type Control struct {
-	Forwarder forward.Maker // Forwarder makes local port forwards
-	mux       libproxy.Multiplexer
-	muxM      sync.Mutex
-	muxC      *sync.Cond
-	forwards  map[string]forward.Forward
-	forwardsM sync.Mutex
-	rec       *libproxy.PcapRecorder // nil unless pcap set
+	Forwarder      forward.Maker // Forwarder makes local port forwards
+	mux            libproxy.Multiplexer
+	muxM           sync.Mutex
+	muxC           *sync.Cond
+	forwards       map[string]forward.Forward
+	forwardsM      sync.Mutex
+	rec            *libproxy.PcapRecorder // nil unless pcap set
+	services       libproxy.Services
+	dockerDataPath *string
 }
 
 func Make() *Control {
-	c := &Control{
-		forwards: make(map[string]forward.Forward),
-	}
-	c.muxC = sync.NewCond(&c.muxM)
-	return c
+	return MakeWithOptions(nil, nil, nil)
 }
 
-func MakeWithPcapRecorder(rec *libproxy.PcapRecorder) *Control {
+func MakeWithOptions(rec *libproxy.PcapRecorder, services libproxy.Services, dockerDataPath *string) *Control {
 	c := &Control{
-		forwards: make(map[string]forward.Forward),
-		rec:      rec,
+		forwards:       make(map[string]forward.Forward),
+		rec:            rec,
+		services:       services,
+		dockerDataPath: dockerDataPath,
 	}
 	c.muxC = sync.NewCond(&c.muxM)
 	return c
@@ -134,18 +137,127 @@ func (c *Control) DumpState(_ context.Context, w io.Writer) error {
 var _ vpnkit.Implementation = &Control{}
 var _ vpnkit.Control = &Control{}
 
+// recvFD reads one SCM_RIGHTS-bearing message from uc, returning the
+// first socket-type fd. Any other fds in the message are closed.
+func recvFD(uc *net.UnixConn) (int, error) {
+	// One dummy byte of payload — recvmsg won't surface cmsg without it.
+	data := make([]byte, 1)
+	oob := make([]byte, syscall.CmsgSpace(4*16)) // up to 16 fds, generous
+	_, oobn, _, _, err := uc.ReadMsgUnix(data, oob)
+	if err != nil {
+		return -1, err
+	}
+	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return -1, fmt.Errorf("ParseSocketControlMessage: %w", err)
+	}
+	chosen := -1
+	for _, scm := range scms {
+		if scm.Header.Level != syscall.SOL_SOCKET || scm.Header.Type != syscall.SCM_RIGHTS {
+			continue
+		}
+		fds, err := syscall.ParseUnixRights(&scm)
+		if err != nil {
+			return -1, fmt.Errorf("ParseUnixRights: %w", err)
+		}
+		for _, fd := range fds {
+			if chosen < 0 && isSocket(fd) {
+				chosen = fd
+				continue
+			}
+			_ = syscall.Close(fd)
+		}
+	}
+	if chosen < 0 {
+		return -1, errors.New("no socket fd in SCM_RIGHTS message")
+	}
+	return chosen, nil
+}
+
+func isSocket(fd int) bool {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return false
+	}
+	return st.Mode&syscall.S_IFMT == syscall.S_IFSOCK
+}
+
+// handshake performs the services key/length/JSON exchange. Endianness
+// is little-endian to match the C reference (which writes raw uint32_t
+// bytes with memcpy).
+func handshake(conn io.ReadWriteCloser, services libproxy.Services) error {
+	servicesMsg, err := json.Marshal(services)
+	if err != nil {
+		return fmt.Errorf("unable to serialize services back to JSON: %s", err)
+	}
+
+	var key uint32
+	if err := binary.Read(conn, binary.LittleEndian, &key); err != nil {
+		return fmt.Errorf("read services key: %w", err)
+	}
+	log.Printf("services key: 0x%08x", key)
+
+	if err := binary.Write(conn, binary.LittleEndian, uint32(len(servicesMsg))); err != nil {
+		return fmt.Errorf("write services length: %w", err)
+	}
+	if _, err := conn.Write(servicesMsg); err != nil {
+		return fmt.Errorf("write services message: %w", err)
+	}
+	log.Printf("sent services message: %d byte(s)", len(servicesMsg))
+	return nil
+}
+
 // Listen for incoming data connections
-func (c *Control) Listen(path string, quit <-chan struct{}) {
+func (c *Control) Listen(path string, fd bool, doHandshake bool, quit <-chan struct{}) {
 	t := transport.Choose(path)
 	l, err := t.Listen(path)
 	if err != nil {
 		log.Fatalf("unable to create a data server on %s %s: %s", t.String(), path, err)
 	}
-	c.ListenOnListener(l, fmt.Sprintf("%s %s", t.String(), path), quit)
+	c.ListenOnListener(l, fmt.Sprintf("%s %s", t.String(), path), fd, doHandshake, quit)
+}
+
+// receives a socket fd via SCM_RIGHTS, acks one byte, and
+// reconstructs a net.Conn around the received fd.
+func (c *Control) receiveFdConn(conn net.Conn) (net.Conn, error) {
+
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return nil, fmt.Errorf("accepted conn is %T, not *net.UnixConn", conn)
+	}
+	fd, err := recvFD(uc)
+	if err != nil {
+		return nil, fmt.Errorf("recv fd: %w", err)
+	}
+
+	// Ack with one byte (matches the C tool's value 253).
+	if _, err := conn.Write([]byte{253}); err != nil {
+		// Best-effort: the peer may close the control immediately;
+		// if it does, ack delivery is irrelevant.
+		log.Printf("warning: ack write failed: %v", err)
+	}
+
+	// Reconstruct a net.Conn around the received fd. os.NewFile takes
+	// ownership; net.FileConn dups the fd internally and we close the
+	// original via file.Close().
+	file := os.NewFile(uintptr(fd), "vpnkit-data-fd")
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("os.NewFile(fd=%d) failed", fd)
+	}
+	newConn, err := net.FileConn(file)
+	_ = file.Close()
+	if err != nil {
+		return nil, fmt.Errorf("net.FileConn: %w", err)
+	}
+	log.Printf("received data fd")
+
+	return newConn, nil
 }
 
 // ListenOnListener listen for incoming data connections on an already setup listener
-func (c *Control) ListenOnListener(l net.Listener, listenerName string, quit <-chan struct{}) {
+func (c *Control) ListenOnListener(l net.Listener, listenerName string,
+	fd bool, doHandshake bool, quit <-chan struct{}) {
 	for {
 		// listen for one connection at a time
 		log.Printf("listening on %s for data connection", listenerName)
@@ -154,16 +266,23 @@ func (c *Control) ListenOnListener(l net.Listener, listenerName string, quit <-c
 			log.Printf("unable to accept connection on %s: %s", listenerName, err)
 			continue
 		}
+		if fd {
+			conn, err = c.receiveFdConn(conn)
+			if err != nil {
+				log.Printf("unable to receive fd on %s: %s", listenerName, err)
+				continue
+			}
+		}
 		log.Printf("accepted data connection on %s", listenerName)
-		c.handleDataConn(conn, quit, false)
+		c.handleDataConn(conn, quit, false, fd || doHandshake)
 	}
 }
 
 // Connect a data connection
-func (c *Control) Connect(path string, quit <-chan struct{}) error {
+func (c *Control) Connect(path string, doHandshake bool, quit <-chan struct{}) error {
 	for {
 		conn := c.connectOnce(path, quit)
-		c.handleDataConn(conn, quit, true)
+		c.handleDataConn(conn, quit, true, doHandshake)
 		// Since there is no initial handshake in t.Dial, sometimes it can connect() successfully
 		// and then handleDataConn immediately returns with an EOF. We need to avoid spinning.
 		log.Printf("data connection closed. Will reconnect in 1s.")
@@ -192,8 +311,14 @@ func (c *Control) connectOnce(path string, quit <-chan struct{}) net.Conn {
 }
 
 // handle data-plane forwarding
-func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{}, allocateBackward bool) {
+func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{}, allocateBackward bool, doHandshake bool) {
 	defer rw.Close()
+
+	if doHandshake {
+		if err := handshake(rw, c.services); err != nil {
+			log.Errorf("unable to perform handshake: %v", err)
+		}
+	}
 
 	mux, err := libproxy.NewMultiplexer("local", rw, allocateBackward)
 	if err == io.EOF || errors.Is(err, syscall.EPIPE) {
@@ -222,6 +347,6 @@ func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{}, al
 			log.Errorf("error accepting subconnection: %v", err)
 			return
 		}
-		go libproxy.Forward(conn, *destination, quit, c.rec)
+		go libproxy.Forward(conn, *destination, quit, c.rec, c.services, c.dockerDataPath)
 	}
 }
