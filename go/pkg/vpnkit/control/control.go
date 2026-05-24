@@ -18,6 +18,7 @@ import (
 	"github.com/moby/vpnkit/go/pkg/vpnkit/forward"
 	"github.com/moby/vpnkit/go/pkg/vpnkit/log"
 	"github.com/moby/vpnkit/go/pkg/vpnkit/transport"
+	"golang.org/x/sys/unix"
 )
 
 type Control struct {
@@ -137,6 +138,22 @@ func (c *Control) DumpState(_ context.Context, w io.Writer) error {
 var _ vpnkit.Implementation = &Control{}
 var _ vpnkit.Control = &Control{}
 
+// sendFD writes one SCM_RIGHTS-bearing message to uc carrying fd. A
+// single dummy payload byte is sent — recvmsg on the peer side won't
+// surface the cmsg without payload, mirroring recvFD's expectation.
+func sendFD(uc *net.UnixConn, fd int) error {
+	rights := syscall.UnixRights(fd)
+	n, oobn, err := uc.WriteMsgUnix([]byte{0}, rights, nil)
+	if err != nil {
+		return fmt.Errorf("WriteMsgUnix: %w", err)
+	}
+	if n != 1 || oobn != len(rights) {
+		return fmt.Errorf("short SCM_RIGHTS write: data=%d/1 oob=%d/%d",
+			n, oobn, len(rights))
+	}
+	return nil
+}
+
 // recvFD reads one SCM_RIGHTS-bearing message from uc, returning the
 // first socket-type fd. Any other fds in the message are closed.
 func recvFD(uc *net.UnixConn) (int, error) {
@@ -182,20 +199,135 @@ func isSocket(fd int) bool {
 	return st.Mode&syscall.S_IFMT == syscall.S_IFSOCK
 }
 
-// handshake performs the services key/length/JSON exchange. Endianness
-// is little-endian to match the C reference (which writes raw uint32_t
-// bytes with memcpy).
-func handshake(conn io.ReadWriteCloser, services libproxy.Services) error {
-	servicesMsg, err := json.Marshal(services)
+// connectedSocketpair returns a (local, remote) pair where:
+//
+//   - local  is a *net.UnixConn backed by one end of a SOCK_STREAM
+//     AF_UNIX socketpair, ready for Read/Write.
+//   - remote is the raw fd of the other end, intended to be handed to
+//     another process via SCM_RIGHTS. The caller must close
+//     remote (with unix.Close) once the SCM_RIGHTS send has
+//     completed; the receiving process holds its own
+//     duplicated reference, so closing the local copy does
+//     not affect the peer.
+//
+// On any error the pair is fully cleaned up before returning.
+func connectedSocketpair() (local *net.UnixConn, remote int, err error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		return fmt.Errorf("unable to serialize services back to JSON: %s", err)
+		return nil, -1, fmt.Errorf("socketpair: %w", err)
+	}
+	ourFD, peerFD := fds[0], fds[1]
+
+	// os.NewFile takes ownership of ourFD; net.FileConn duplicates
+	// internally, so closing f below does not invalidate conn.
+	f := os.NewFile(uintptr(ourFD), "socketpair")
+	if f == nil {
+		_ = unix.Close(ourFD)
+		_ = unix.Close(peerFD)
+		return nil, -1, fmt.Errorf("os.NewFile(fd=%d) failed", ourFD)
+	}
+	conn, err := net.FileConn(f)
+	_ = f.Close() // drops our reference; conn's dup remains valid
+	if err != nil {
+		_ = unix.Close(peerFD)
+		return nil, -1, fmt.Errorf("net.FileConn: %w", err)
+	}
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		_ = unix.Close(peerFD)
+		return nil, -1, fmt.Errorf("net.FileConn returned %T, want *net.UnixConn", conn)
+	}
+	return uc, peerFD, nil
+}
+
+// handshakeConnect performs the services max_length/length/JSON exchange from
+// the connecting side.
+func handshakeConnect(conn io.ReadWriteCloser) (libproxy.Services, error) {
+	bufLen := uint32(0xf2ed) // at least I think that's the max buf length...
+	buf := make([]byte, bufLen)
+
+	if err := binary.Write(conn, binary.LittleEndian, bufLen); err != nil {
+		return nil, fmt.Errorf("write services max length: %w", err)
+	}
+	log.Printf("sent services max length: 0x%08x", bufLen)
+
+	var msgLen uint32
+	if err := binary.Read(conn, binary.LittleEndian, &msgLen); err != nil {
+		return nil, fmt.Errorf("read services max length: %w", err)
 	}
 
-	var key uint32
-	if err := binary.Read(conn, binary.LittleEndian, &key); err != nil {
-		return fmt.Errorf("read services key: %w", err)
+	if msgLen > bufLen {
+		return nil, fmt.Errorf("services message larger than max buffer size")
 	}
-	log.Printf("services key: 0x%08x", key)
+
+	recvLen, err := io.ReadAtLeast(conn, buf, int(msgLen))
+	if err != nil {
+		return nil, fmt.Errorf("read services message (%d bytes): %w", msgLen, err)
+	}
+	log.Printf("received services message: %d/%d byte(s)", recvLen, msgLen)
+
+	var services libproxy.Services
+	if err := json.Unmarshal(buf[0:msgLen], &services); err != nil {
+		return nil, fmt.Errorf("parse services JSON: %w", err)
+	}
+	return services, nil
+}
+
+// Connect to upstream and receive services
+func ConnectForServices(path string) (libproxy.Services, error) {
+	log.Printf("dialing unix %s for bridge-fd socket", path)
+	fdBridgeConn, err := net.DialUnix("unix", nil,
+		&net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		return nil, err
+	}
+	defer fdBridgeConn.Close()
+
+	localConn, remoteFd, err := connectedSocketpair()
+	if err != nil {
+		return nil, err
+	}
+	defer localConn.Close()
+	defer syscall.Close(remoteFd)
+
+	err = sendFD(fdBridgeConn, remoteFd)
+	if err != nil {
+		return nil, err
+	}
+
+	ack := make([]byte, 1)
+	ackLen, err := fdBridgeConn.Read(ack)
+	if err != nil {
+		return nil, err
+	}
+	if ackLen != 1 {
+		return nil, fmt.Errorf("did not receive single byte ack, but %d bytes", ackLen)
+	}
+	if ack[0] != 253 {
+		return nil, fmt.Errorf("did not receive expected ack with 253, but %d", ack[0])
+	}
+
+	// do the handshake and retrieve the services from the upstream, then close
+	// all connections
+	services, err := handshakeConnect(localConn)
+
+	return services, err
+}
+
+// handshake performs the services max_length/length/JSON exchange.
+func handshake(conn io.ReadWriteCloser, services libproxy.Services) error {
+	servicesMsg := []byte(services.String())
+
+	var maxLen uint32
+	if err := binary.Read(conn, binary.LittleEndian, &maxLen); err != nil {
+		return fmt.Errorf("read services max length: %w", err)
+	}
+	log.Printf("read services max length: 0x%08x", maxLen)
+
+	if uint32(len(servicesMsg)) > maxLen {
+		return fmt.Errorf("services message is too long for upstream buffer")
+	}
 
 	if err := binary.Write(conn, binary.LittleEndian, uint32(len(servicesMsg))); err != nil {
 		return fmt.Errorf("write services length: %w", err)
@@ -230,11 +362,9 @@ func (c *Control) receiveFdConn(conn net.Conn) (net.Conn, error) {
 		return nil, fmt.Errorf("recv fd: %w", err)
 	}
 
-	// Ack with one byte (matches the C tool's value 253).
+	// Ack with one byte.
 	if _, err := conn.Write([]byte{253}); err != nil {
-		// Best-effort: the peer may close the control immediately;
-		// if it does, ack delivery is irrelevant.
-		log.Printf("warning: ack write failed: %v", err)
+		return nil, fmt.Errorf("warning: ack write failed: %v", err)
 	}
 
 	// Reconstruct a net.Conn around the received fd. os.NewFile takes
@@ -260,7 +390,7 @@ func (c *Control) ListenOnListener(l net.Listener, listenerName string,
 	fd bool, doHandshake bool, quit <-chan struct{}) {
 	for {
 		// listen for one connection at a time
-		log.Printf("listening on %s for data connection", listenerName)
+		log.Printf("listening on %s for data connection (fd %t, handshake %t)", listenerName, fd, doHandshake)
 		conn, err := l.Accept()
 		if err != nil {
 			log.Printf("unable to accept connection on %s: %s", listenerName, err)
@@ -311,7 +441,8 @@ func (c *Control) connectOnce(path string, quit <-chan struct{}) net.Conn {
 }
 
 // handle data-plane forwarding
-func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{}, allocateBackward bool, doHandshake bool) {
+func (c *Control) handleDataConn(rw io.ReadWriteCloser, quit <-chan struct{},
+	allocateBackward bool, doHandshake bool) {
 	defer rw.Close()
 
 	if doHandshake {

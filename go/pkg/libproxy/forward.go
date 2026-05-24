@@ -20,6 +20,11 @@ type service struct {
 
 type Services map[string]service
 
+func (s *Services) String() string {
+	str, _ := json.MarshalIndent(s, "", "  ")
+	return string(str)
+}
+
 // Load reads and parses the services file at path.
 func LoadServices(path string) (Services, error) {
 	b, err := os.ReadFile(path)

@@ -18,6 +18,7 @@ import (
 
 var (
 	controlListen       string
+	bridgeFdConnect     string
 	dataListen          string
 	dataListenFd        string
 	dataListenHandshake string
@@ -47,8 +48,9 @@ func main() {
 	flag.StringVar(&dataConnect, "data-connect", "", "AF_VSOCK port or socket/Pipe path to connect to on the host for data connections")
 	flag.StringVar(&dockerDataPath, "docker-data-path", getDefaultDockerPath(),
 		"path to docker data directory with UNIX sockets (default: ~/Library/Containers/com.docker.docker/Data/)")
+	flag.StringVar(&bridgeFdConnect, "bridge-fd-connect", "", "connect to to docker's upstream bridge-fd socket at the given path to retrieve services")
 	flag.StringVar(&pcap, "pcap", "", "PCAP file path")
-	flag.StringVar(&servicesFile, "services", "", "path to a services JSON file; host-backed entries are exposed as Unix pipe forwards")
+	flag.StringVar(&servicesFile, "services", "", "path to a services JSON file")
 	flag.BoolVar(&debug, "debug", false, "Enable debug logging")
 	flag.Parse()
 	if dataListen == "" && dataListenFd == "" && dataListenHandshake == "" && dataConnect == "" {
@@ -71,17 +73,25 @@ func main() {
 
 	var services libproxy.Services
 	if dataListenFd != "" || dataListenHandshake != "" {
-		if servicesFile == "" {
-			log.Fatalf("must provide services file with -data-listen-fd")
+		if bridgeFdConnect == "" && servicesFile == "" {
+			log.Fatalf("must provide either services file or bridge-fd socket with -data-listen-fd")
 		}
 		if dockerDataPath == "" {
 			log.Fatalf("must provide valid -docker-data-path")
 		}
 
-		services, err = libproxy.LoadServices(servicesFile)
-		if err != nil {
-			log.Fatalf("reading services file %s: %s", servicesFile, err)
+		if bridgeFdConnect != "" {
+			services, err = control.ConnectForServices(bridgeFdConnect)
+			if err != nil {
+				log.Fatalf("failed to retrieve services from bridge-fd socket: %s", err)
+			}
+		} else {
+			services, err = libproxy.LoadServices(servicesFile)
+			if err != nil {
+				log.Fatalf("reading services file %s: %s", servicesFile, err)
+			}
 		}
+		log.Printf("services: %s", services.String())
 	}
 
 	ctrl := control.MakeWithOptions(rec, services, &dockerDataPath)
